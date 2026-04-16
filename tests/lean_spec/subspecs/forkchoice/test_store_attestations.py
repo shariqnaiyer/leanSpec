@@ -553,6 +553,57 @@ class TestAggregateCommitteeSignatures:
         # Verify no proofs were created
         assert len(updated_store.latest_new_aggregated_payloads) == 0
 
+    def test_aggregate_child_proofs_only_no_raw_entries(self, key_manager: XmssKeyManager) -> None:
+        """Aggregation succeeds with multiple child proofs and no raw gossip signatures.
+
+        When two or more child proofs exist for the same AttestationData but no
+        gossip signatures are present, the aggregator must merge the child proofs
+        without constructing a participants bitfield from empty raw entries.
+
+        Regression test: previously the code unconditionally built
+        ValidatorIndices from the empty raw_entries list, which raised
+        AssertionError from to_aggregation_bits.
+        """
+        store, attestation_data = make_store_with_attestation_data(
+            key_manager, num_validators=4, validator_id=ValidatorIndex(0)
+        )
+
+        # Create two child proofs covering disjoint validators.
+        proof_a = make_aggregated_proof(key_manager, [ValidatorIndex(1)], attestation_data)
+        proof_b = make_aggregated_proof(key_manager, [ValidatorIndex(2)], attestation_data)
+
+        # Place both proofs in latest_new_aggregated_payloads with NO
+        # gossip signatures for this attestation data.
+        store = store.model_copy(
+            update={
+                "latest_new_aggregated_payloads": {
+                    attestation_data: {proof_a, proof_b},
+                },
+                "attestation_signatures": {},
+            }
+        )
+
+        updated_store, new_aggregates = store.aggregate()
+
+        # The two child proofs should be merged into one aggregate.
+        assert len(new_aggregates) == 1
+        merged_proof = new_aggregates[0].proof
+
+        # The merged proof must cover both validators.
+        merged_validators = set(merged_proof.participants.to_validator_indices())
+        assert merged_validators == {ValidatorIndex(1), ValidatorIndex(2)}
+
+        # The proof must be cryptographically valid.
+        public_keys = [
+            key_manager[vid].attestation_public
+            for vid in merged_proof.participants.to_validator_indices()
+        ]
+        merged_proof.verify(
+            public_keys=public_keys,
+            message=hash_tree_root(attestation_data),
+            slot=attestation_data.slot,
+        )
+
     def test_multiple_attestation_data_grouped_separately(
         self, key_manager: XmssKeyManager
     ) -> None:

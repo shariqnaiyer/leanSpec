@@ -1007,9 +1007,14 @@ class Store(StrictBaseModel):
                 continue
 
             # Encode the set of raw signers as a compact bitfield.
-            xmss_participants = ValidatorIndices(
-                data=[vid for vid, _, _ in raw_entries]
-            ).to_aggregation_bits()
+            #
+            # When merging child proofs without new raw signatures,
+            # no participants bitfield is needed.
+            xmss_participants = (
+                ValidatorIndices(data=[vid for vid, _, _ in raw_entries]).to_aggregation_bits()
+                if raw_entries
+                else None
+            )
             raw_xmss = [(pk, sig) for _, pk, sig in raw_entries]
 
             # Phase 3: Aggregate
