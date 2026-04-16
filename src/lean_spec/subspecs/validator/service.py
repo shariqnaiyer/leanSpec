@@ -111,6 +111,9 @@ class ValidatorService:
     _attested_slots: set[Slot] = field(default_factory=set, repr=False)
     """Slots for which we've already produced attestations (prevents duplicates)."""
 
+    _proposed_slots: set[Slot] = field(default_factory=set, repr=False)
+    """Slots for which we've already attempted block production (prevents duplicates)."""
+
     async def run(self) -> None:
         """
         Main loop - check duties every interval.
@@ -163,13 +166,18 @@ class ValidatorService:
                 my_indices,
             )
 
-            if interval == Uint64(0):
-                # Block production interval.
+            if slot not in self._proposed_slots:
+                # Block production.
                 #
-                # Check if any of our validators is the proposer.
-                logger.debug("ValidatorService: checking block production for slot %d", slot)
-                await self._maybe_produce_block(slot)
-                logger.debug("ValidatorService: done block production check for slot %d", slot)
+                # Ideally runs at interval 0, but on slow machines the event loop
+                # may wake past interval 0. Produce the block at any interval within
+                # the first half of the slot to avoid missing the window entirely.
+                # The _proposed_slots set prevents duplicate attempts.
+                if interval <= Uint64(1):
+                    logger.debug("ValidatorService: checking block production for slot %d", slot)
+                    await self._maybe_produce_block(slot)
+                    logger.debug("ValidatorService: done block production check for slot %d", slot)
+                self._proposed_slots.add(slot)
 
                 # Re-fetch interval after block production.
                 #
@@ -207,6 +215,7 @@ class ValidatorService:
                 # We never need to attest for slots that far in the past.
                 prune_threshold = Slot(max(0, int(slot) - 4))
                 self._attested_slots = {s for s in self._attested_slots if s >= prune_threshold}
+                self._proposed_slots = {s for s in self._proposed_slots if s >= prune_threshold}
 
             # Intervals 2-4 have no additional validator duties.
 
