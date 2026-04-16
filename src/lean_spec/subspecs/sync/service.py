@@ -1,792 +1,530 @@
 """
-Sync service orchestrator.
+Validator service for producing blocks and attestations.
 
-This is the main entry point for synchronization.
+The Validator Problem
+---------------------
+Ethereum consensus requires active participation from validators.
 
-The Core Problem
+At specific intervals within each slot, validators must:
+- Interval 0: Propose blocks (if scheduled)
+- Interval 1: Create attestations (broadcast to subnet topics only)
 
-When an Ethereum node starts, it has no chain history. Before it can validate
-new blocks or produce attestations, it must synchronize with the network.
+This service drives validator duties by monitoring the slot clock
+and triggering production at the appropriate intervals.
 
-This involves:
-1. **Discovery**: Finding peers with chain data
-2. **Assessment**: Determining how far behind we are
-3. **Download**: Fetching missing blocks when they arrive out of order
-4. **Validation**: Verifying and integrating blocks into our Store
+Dual-Key Signing Design
+------------------------
+Each validator has two XMSS key pairs:
 
-How It Works
+- **Proposal key**: Signs the block root (hash_tree_root(block)) during proposal
+- **Attestation key**: Signs gossip attestations for aggregation
 
-- Blocks arrive via gossip subscription
-- If parent is known, process immediately
-- If parent is unknown, cache block and fetch parent (backfill)
-- When parents arrive, process waiting children
+Proposers produce two signatures per slot:
 
-State Machine
+1. Interval 0: Proposer signature over the block root (proposal key)
+2. Interval 1: Gossip attestation like all other validators (attestation key)
 
-::
-
-    IDLE --> SYNCING --> SYNCED
-      ^         |           |
-      +---------+-----------+
-
-- **IDLE**: Not syncing. Waiting for peers.
-- **SYNCING**: Actively processing gossip and backfilling missing parents.
-- **SYNCED**: Caught up with the network. Passive gossip only.
+These use independent keys, so OTS constraints do not conflict.
+The proposer's attestation is not special — it flows through the normal
+gossip/aggregation pipeline and gets included in a future block.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Literal
 
-from lean_spec.subspecs.chain.clock import SlotClock
+from lean_spec.subspecs.chain.clock import Interval, SlotClock
 from lean_spec.subspecs.containers import (
+    AttestationData,
     Block,
-    SignedAggregatedAttestation,
     SignedAttestation,
     SignedBlock,
+    ValidatorIndex,
+)
+from lean_spec.subspecs.containers.block import (
+    AttestationSignatures,
+    BlockSignatures,
 )
 from lean_spec.subspecs.containers.slot import Slot
-from lean_spec.subspecs.containers.validator import SubnetId
-from lean_spec.subspecs.forkchoice.store import Store
-from lean_spec.subspecs.metrics import registry as metrics
-from lean_spec.subspecs.networking.reqresp.message import Status
-from lean_spec.subspecs.networking.transport.peer_id import PeerId
 from lean_spec.subspecs.ssz.hash import hash_tree_root
-from lean_spec.subspecs.storage import Database
+from lean_spec.subspecs.sync import SyncService
+from lean_spec.subspecs.xmss import TARGET_SIGNATURE_SCHEME
+from lean_spec.subspecs.xmss.aggregation import AggregatedSignatureProof
+from lean_spec.subspecs.xmss.containers import Signature
+from lean_spec.types import Bytes32, Uint64
 
-from .backfill_sync import BackfillSync, NetworkRequester
-from .block_cache import BlockCache
-from .config import MAX_PENDING_ATTESTATIONS
-from .head_sync import HeadSync
-from .peer_manager import PeerManager
-from .states import SyncState
+from .registry import ValidatorEntry, ValidatorRegistry
 
 logger = logging.getLogger(__name__)
 
-
-def default_block_processor(
-    store: Store,
-    block: SignedBlock,
-) -> Store:
-    """Default block processor using store block processing."""
-    return store.on_block(block)
+type BlockPublisher = Callable[[SignedBlock], Awaitable[None]]
+"""Callback for publishing signed blocks."""
+type AttestationPublisher = Callable[[SignedAttestation], Awaitable[None]]
+"""Callback for publishing produced attestations."""
 
 
-async def _noop_publish_agg(signed_attestation: SignedAggregatedAttestation) -> None:
-    """No-op default for aggregated attestation publishing."""
+async def _noop_block_publisher(block: SignedBlock) -> None:  # noqa: ARG001
+    """Default no-op block publisher."""
 
 
-@dataclass(slots=True)
-class SyncProgress:
-    """
-    Current synchronization progress.
-
-    Provides a snapshot of sync state for monitoring and logging.
-    """
-
-    state: SyncState
-    """Current sync state machine state."""
-
-    local_head_slot: Slot | None = None
-    """Slot of our current chain head."""
-
-    network_finalized_slot: Slot | None = None
-    """Network consensus on finalized slot (mode of peer reports)."""
-
-    blocks_processed: int = 0
-    """Total blocks integrated into Store this session."""
-
-    peers_connected: int = 0
-    """Number of connected peers with status."""
-
-    cache_size: int = 0
-    """Number of blocks in pending cache."""
-
-    orphan_count: int = 0
-    """Number of orphan blocks awaiting parents."""
+async def _noop_attestation_publisher(attestation: SignedAttestation) -> None:  # noqa: ARG001
+    """Default no-op attestation publisher."""
 
 
 @dataclass(slots=True)
-class SyncService:
+class ValidatorService:
     """
-    Main synchronization orchestrator.
+    Drives validator duties based on the slot clock.
 
-    SyncService is the central coordinator for all sync activities. It:
-
-    - Manages the sync state machine (IDLE -> SYNCING -> SYNCED)
-    - Coordinates HeadSync and BackfillSync
-    - Handles gossip block arrivals
-    - Tracks peer status updates
-    - Maintains the forkchoice Store
-
-    Design Philosophy
-
-    The service is designed to be:
-
-    **Reactive**: Responds to gossip blocks rather than proactively fetching.
-    **Simple**: No complex batch coordination or range downloads.
-    **Resilient**: Handles peer failures and invalid blocks gracefully.
-    **Observable**: Exposes progress for monitoring and debugging.
-
-    The service does not own the network layer. It receives events and uses
-    injected interfaces to make requests.
+    - Monitors interval boundaries
+    - Triggers block production or attestation creation when scheduled
     """
 
-    store: Store
-    """Current forkchoice store. Updated as blocks are processed."""
-
-    peer_manager: PeerManager
-    """Peer manager for selection."""
-
-    block_cache: BlockCache
-    """Block cache for pending blocks."""
+    sync_service: SyncService
+    """Service providing access to the forkchoice store."""
 
     clock: SlotClock
-    """Slot clock for time conversion."""
+    """Slot clock for time calculation."""
 
-    network: NetworkRequester
-    """Network interface for block requests."""
+    registry: ValidatorRegistry
+    """Registry of validators we control."""
 
-    database: Database | None = field(default=None)
-    """Optional database for persisting blocks and states."""
+    on_block: BlockPublisher = field(default=_noop_block_publisher)
+    """Callback invoked when a block is produced."""
 
-    is_aggregator: bool = field(default=False)
-    """Whether this node functions as an aggregator."""
+    on_attestation: AttestationPublisher = field(default=_noop_attestation_publisher)
+    """Callback invoked when an attestation is produced."""
 
-    aggregate_subnet_ids: tuple[SubnetId, ...] = field(default_factory=tuple)
-    """
-    Explicit subnet IDs to subscribe to and aggregate from.
+    _running: bool = field(default=False, repr=False)
+    """Whether the service is running."""
 
-    When set, the node subscribes to these subnets at the p2p layer in
-    addition to its validator-derived subnet. Only active when is_aggregator
-    is also True — non-aggregator nodes never import gossip attestations.
-    """
+    _blocks_produced: int = field(default=0, repr=False)
+    """Counter for produced blocks."""
 
-    process_block: Callable[[Store, SignedBlock], Store] = field(default=default_block_processor)
-    """Block processor function. Defaults to the store's block processing."""
+    _attestations_produced: int = field(default=0, repr=False)
+    """Counter for produced attestations."""
 
-    _publish_agg_fn: Callable[[SignedAggregatedAttestation], Coroutine[None, None, None]] = field(
-        default=_noop_publish_agg
-    )
-    """Callback for publishing aggregated attestations to the network."""
+    _attested_slots: set[Slot] = field(default_factory=set, repr=False)
+    """Slots for which we've already produced attestations (prevents duplicates)."""
 
-    _state: SyncState = field(default=SyncState.IDLE)
-    """Current sync state. Defaults to IDLE, awaiting peer status."""
+    _proposed_slots: set[Slot] = field(default_factory=set, repr=False)
+    """Slots for which we've already attempted block production (prevents duplicates)."""
 
-    genesis_start: bool = field(default=False)
-    """When True, start in SYNCING state to accept gossip without waiting for peers."""
-
-    _backfill: BackfillSync | None = field(default=None)
-    """Backfill syncer instance (created lazily)."""
-
-    _head_sync: HeadSync | None = field(default=None)
-    """Head syncer instance (created lazily)."""
-
-    _blocks_processed: int = field(default=0)
-    """Counter for processed blocks."""
-
-    _sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    """Lock to prevent concurrent sync operations."""
-
-    _pending_attestations: list[SignedAttestation] = field(default_factory=list)
-    """Attestations awaiting block processing.
-
-    When an attestation arrives before its referenced block, it cannot be validated.
-    Rather than dropping it permanently, we buffer it here and retry after the next
-    block is processed.
-    """
-
-    _pending_aggregated_attestations: list[SignedAggregatedAttestation] = field(
-        default_factory=list
-    )
-    """Aggregated attestations awaiting block processing.
-
-    Same buffering strategy as individual attestations.
-    """
-
-    def set_publish_agg_fn(
-        self, fn: Callable[[SignedAggregatedAttestation], Coroutine[None, None, None]]
-    ) -> None:
-        """Wire the aggregated attestation publisher after construction.
-
-        Breaks circular dependency between SyncService and NetworkService.
-        NetworkService needs SyncService at construction, but SyncService
-        needs NetworkService's publish method. This setter resolves the cycle.
+    async def run(self) -> None:
         """
-        self._publish_agg_fn = fn
+        Main loop - check duties every interval.
 
-    def __post_init__(self) -> None:
-        """Initialize sync components."""
-        self._init_components()
+        The loop:
+        1. Sleeps until the next interval boundary
+        2. Checks current interval within the slot
+        3. Triggers appropriate duties
+        4. Repeats until stopped
 
-        # Genesis validators already hold the full genesis state so they
-        # should process gossip blocks immediately without waiting for a
-        # peer Status exchange.
-        if self.genesis_start:
-            self._state = SyncState.SYNCING
-
-    def _init_components(self) -> None:
+        NOTE: We track the last handled interval to avoid skipping intervals.
+        If duty processing takes time and we end up in a new interval, we
+        handle that interval immediately instead of sleeping past it.
         """
-        Initialize sync sub-components.
+        self._running = True
+        last_handled_total_interval: Interval | None = None
 
-        Creates BackfillSync and HeadSync instances with shared dependencies.
+        while self._running:
+            # Get current total interval count (not just within-slot).
+            total_interval = self.clock.total_intervals()
+
+            # If we've already handled this interval, sleep until the next boundary.
+            already_handled = (
+                last_handled_total_interval is not None
+                and total_interval <= last_handled_total_interval
+            )
+            if already_handled:
+                await self.clock.sleep_until_next_interval()
+                total_interval = self.clock.total_intervals()
+
+            # Skip if we have no validators to manage.
+            if len(self.registry) == 0:
+                last_handled_total_interval = total_interval
+                continue
+
+            # Get current slot and interval.
+            #
+            # Interval determines which duty type to check:
+            # - Interval 0: Block production
+            # - Interval 1: Attestation production
+            slot = self.clock.current_slot()
+            interval = self.clock.current_interval()
+
+            my_indices = list(self.registry.indices())
+            logger.debug(
+                "ValidatorService: slot=%d interval=%d total_interval=%d my_indices=%s",
+                slot,
+                interval,
+                total_interval,
+                my_indices,
+            )
+
+            if slot not in self._proposed_slots:
+                # Block production.
+                #
+                # Ideally runs at interval 0, but on slow machines the event loop
+                # may wake past interval 0. Produce the block at any interval within
+                # the first half of the slot to avoid missing the window entirely.
+                # The _proposed_slots set prevents duplicate attempts.
+                if interval <= Uint64(1):
+                    logger.debug("ValidatorService: checking block production for slot %d", slot)
+                    await self._maybe_produce_block(slot)
+                    logger.debug("ValidatorService: done block production check for slot %d", slot)
+                self._proposed_slots.add(slot)
+
+                # Re-fetch interval after block production.
+                #
+                # Block production can take time (signing, network calls, etc.).
+                # If we've moved past interval 0, we should check attestation production
+                # in this same iteration rather than sleeping and missing it.
+                interval = self.clock.current_interval()
+
+            # Attestation check - produce if we haven't attested for this slot yet.
+            #
+            # Non-proposers attest at interval 1. Proposers bundle their attestation
+            # in the block (interval 0). But if we missed interval 1 due to timing,
+            # we should still attest as soon as we can within the same slot.
+            #
+            # We track attested slots to prevent duplicate attestations.
+            logger.debug(
+                "ValidatorService: attestation check interval=%d slot=%d attested=%s",
+                interval,
+                slot,
+                slot in self._attested_slots,
+            )
+            if interval >= Uint64(1) and slot not in self._attested_slots:
+                logger.debug(
+                    "ValidatorService: producing attestations for slot %d (interval %d)",
+                    slot,
+                    interval,
+                )
+                await self._produce_attestations(slot)
+                logger.debug("ValidatorService: done producing attestations for slot %d", slot)
+                self._attested_slots.add(slot)
+
+                # Prune old entries to prevent unbounded growth.
+                #
+                # Keep only recent slots (current slot - 4) to bound memory usage.
+                # We never need to attest for slots that far in the past.
+                prune_threshold = Slot(max(0, int(slot) - 4))
+                self._attested_slots = {s for s in self._attested_slots if s >= prune_threshold}
+                self._proposed_slots = {s for s in self._proposed_slots if s >= prune_threshold}
+
+            # Intervals 2-4 have no additional validator duties.
+
+            # Mark this interval as handled.
+            #
+            # Use the current total interval, not the one from loop start.
+            # This prevents re-handling intervals we've already covered.
+            last_handled_total_interval = self.clock.total_intervals()
+            logger.debug(
+                "ValidatorService: end of iteration, last_handled=%d, sleeping...",
+                last_handled_total_interval,
+            )
+
+    async def _maybe_produce_block(self, slot: Slot) -> None:
         """
-        # BackfillSync handles fetching missing parent blocks from peers.
-        #
-        # It needs network access to request blocks and the cache to store them.
-        self._backfill = BackfillSync(
-            peer_manager=self.peer_manager,
-            block_cache=self.block_cache,
-            network=self.network,
-        )
+        Produce a block if we are the proposer for this slot.
 
-        # HeadSync processes incoming gossip blocks and coordinates backfill.
-        #
-        # We inject our wrapper to track block processing metrics.
-        self._head_sync = HeadSync(
-            block_cache=self.block_cache,
-            backfill=self._backfill,
-            process_block=self._process_block_wrapper,
-        )
+        Checks the proposer schedule against our validator registry.
+        If one of our validators should propose, produces and emits the block.
 
-    def _process_block_wrapper(
-        self,
-        store: Store,
-        block: SignedBlock,
-    ) -> Store:
-        """
-        Wrapper for block processing that updates counters and persists data.
-
-        This wrapper is injected into HeadSync to track processed blocks
-        and optionally persist them to the database.
-        """
-        # Delegate to the actual block processor.
-        #
-        # The processor validates the block and updates forkchoice state.
-        new_store = self.process_block(store, block)
-
-        # Track processed blocks.
-        #
-        # We only count blocks that pass validation and update the store.
-        self._blocks_processed += 1
-
-        # Persist block and state to database if available.
-        #
-        # This is write-through: data is persisted synchronously after processing.
-        # The database call is optional - nodes can run without persistence.
-        if self.database is not None:
-            self._persist_block(new_store, block.block)
-
-        return new_store
-
-    def _persist_block(self, store: Store, block: Block) -> None:
-        """
-        Persist block and its post-state to the database.
-
-        Called after successful block processing to ensure data survives restarts.
-        All writes are committed atomically to prevent partial persistence on crash.
+        The proposer signs the block root with the proposal key.
+        Attestation happens separately at interval 1 using the attestation key.
 
         Args:
-            store: The updated store containing the new block and state.
-            block: The block that was just processed.
+            slot: Current slot number.
         """
-        if self.database is None:
+        store = self.sync_service.store
+        head_state = store.states.get(store.head)
+        if head_state is None:
+            logger.debug("Block production: no head state for slot %d", slot)
             return
 
-        block_root = hash_tree_root(block)
+        num_validators = Uint64(len(head_state.validators))
+        if num_validators == Uint64(0):
+            logger.debug("Block production: no validators in state for slot %d", slot)
+            return
 
-        # Atomic write ensures all-or-nothing persistence.
+        my_indices = list(self.registry.indices())
+        expected_proposer = int(slot) % int(num_validators)
+        logger.debug(
+            "Block production check: slot=%d num_validators=%d expected_proposer=%d my_indices=%s",
+            slot,
+            num_validators,
+            expected_proposer,
+            my_indices,
+        )
+
+        # Check each validator we control.
         #
-        # A crash between individual writes would leave the database
-        # inconsistent (e.g., block stored but head root not updated).
-        with self.database.batch_write():
-            self.database.put_block(block, block_root)
+        # Only one validator can be the proposer per slot.
+        for validator_index in self.registry.indices():
+            if not validator_index.is_proposer_for(slot, num_validators):
+                continue
 
-            post_state = store.states.get(block_root)
-            if post_state is not None:
-                self.database.put_state(post_state, block_root)
-
-                # Index state root → block root for checkpoint sync lookups.
-                state_root = hash_tree_root(post_state)
-                self.database.put_block_root_by_state_root(state_root, block_root)
-
-            self.database.put_block_root_by_slot(block.slot, block_root)
-            self.database.put_head_root(store.head)
-            self.database.put_justified_checkpoint(store.latest_justified)
-            self.database.put_finalized_checkpoint(store.latest_finalized)
-
-            # Prune old data when finalization advances.
-            #
-            # Blocks and states before the finalized slot are no longer needed
-            # for consensus, except the finalized block itself.
-            finalized_slot = store.latest_finalized.slot
-            if finalized_slot > Slot(0):
-                self.database.prune_before_slot(
-                    finalized_slot,
-                    keep_roots=frozenset({store.latest_finalized.root}),
+            # We are the proposer for this slot.
+            try:
+                new_store, block, signatures = store.produce_block_with_signatures(
+                    slot=slot,
+                    validator_index=validator_index,
                 )
 
-    @property
-    def state(self) -> SyncState:
-        """Current sync state."""
-        return self._state
+                # Diagnostic: log parent details so we can verify interop tests.
+                parent_block = store.blocks.get(block.parent_root)
+                parent_slot = parent_block.slot if parent_block else "UNKNOWN"
+                parent_proposer = parent_block.proposer_index if parent_block else "?"
+                logger.info(
+                    "Produced block slot=%d proposer=%d parent_root=%s "
+                    "parent_slot=%s parent_proposer=%s",
+                    slot,
+                    validator_index,
+                    block.parent_root.hex()[:16],
+                    parent_slot,
+                    parent_proposer,
+                )
 
-    @property
-    def is_syncing(self) -> bool:
-        """Check if actively syncing."""
-        return self._state.is_syncing
+                self.sync_service.store = new_store
 
-    @property
-    def is_synced(self) -> bool:
-        """Check if synced with network."""
-        return self._state.is_synced
+                # Sign the block: proposer_signature covers the block root.
+                signed_block = self._sign_block(block, validator_index, signatures)
 
-    def get_progress(self) -> SyncProgress:
+                self._blocks_produced += 1
+
+                # Emit the block for network propagation.
+                await self.on_block(signed_block)
+
+            except AssertionError as e:
+                # Proposer validation failed.
+                #
+                # This can happen during slot boundary transitions.
+                # Block production is skipped; attestation still happens at interval 1.
+                logger.debug(
+                    "Block production skipped for validator %d at slot %d: %s",
+                    validator_index,
+                    slot,
+                    e,
+                )
+
+            # Only one proposer per slot.
+            break
+
+    async def _produce_attestations(self, slot: Slot) -> None:
         """
-        Get current sync progress.
+        Produce gossip attestations for all validators we control.
 
-        Returns:
-            Snapshot of sync state for monitoring.
-        """
-        # Our head slot tells us where we are in the chain.
-        #
-        # This is the slot of the block our forkchoice currently considers head.
-        head_slot = self.store.blocks[self.store.head].slot
-
-        # Network finalized slot represents consensus across peers.
-        #
-        # This is calculated as the mode of peer-reported finalized slots.
-        # A None value means we have not received enough peer status messages.
-        network_slot = self.peer_manager.get_network_finalized_slot()
-
-        return SyncProgress(
-            state=self._state,
-            local_head_slot=head_slot,
-            network_finalized_slot=network_slot,
-            blocks_processed=self._blocks_processed,
-            # Only count peers that have an active connection.
-            peers_connected=sum(1 for p in self.peer_manager.get_all_peers() if p.is_connected()),
-            cache_size=len(self.block_cache),
-            # Orphans are blocks waiting for parents to be fetched via backfill.
-            orphan_count=self.block_cache.orphan_count,
-        )
-
-    async def on_peer_status(self, peer_id: PeerId, status: Status) -> None:
-        """
-        Handle peer status message.
-
-        Called when a peer sends their chain status.
-
-        This updates our view of the network and may trigger sync if we are behind.
+        Every validator gossips an attestation signed with the attestation key.
+        Proposers also attest here — their block envelope carries a separate
+        proposal-key signature, so there is no conflict with OTS constraints.
 
         Args:
-            peer_id: The peer that sent the status.
-            status: The peer's chain status.
+            slot: Current slot number.
         """
-        # Record this peer's view of the chain.
+        # Wait briefly for the current slot's block to arrive via gossip.
         #
-        # Status contains their head root, head slot, and finalized checkpoint.
-        # We use this to build a picture of network consensus.
-        self.peer_manager.update_status(peer_id, status)
+        # At interval 1 (800ms after slot start), the slot's block may not
+        # have arrived yet from the proposer node (production + gossip + verification
+        # can exceed 800ms on slow machines). Without the block, attestations
+        # would reference an old head, causing safe_target to stall.
+        store = self.sync_service.store
+        current_slot_has_block = any(block.slot == slot for block in store.blocks.values())
+        if not current_slot_has_block:
+            for _ in range(8):
+                await asyncio.sleep(0.05)
+                store = self.sync_service.store
+                if any(block.slot == slot for block in store.blocks.values()):
+                    break
 
-        # Check if this new information means we should start syncing.
-        #
-        # For example: if the peer reports a finalized slot ahead of our head,
-        # we need to sync to catch up with the network.
-        await self._check_sync_trigger()
+        # Ensure we are attesting to the latest known head
+        self.sync_service.store = self.sync_service.store.update_head()
+        store = self.sync_service.store
 
-    async def on_gossip_block(
-        self,
-        block: SignedBlock,
-        peer_id: PeerId | None,
-    ) -> None:
-        """
-        Handle block received via gossip.
-
-        Called when a block arrives from gossip subscription.
-
-        The block may be processable immediately or may need to wait for parents.
-
-        Args:
-            block: The signed block received.
-            peer_id: The peer that propagated the block.
-        """
-        # Guard: Only process gossip in states that accept it.
-        #
-        # - IDLE state does not accept gossip because we have no peer information.
-        # - SYNCING and SYNCED states accept gossip for different reasons.
-        if not self._state.accepts_gossip:
-            logger.debug(
-                "Rejecting gossip block from %s: state %s does not accept gossip",
-                peer_id,
-                self._state.name,
-            )
+        head_state = store.states.get(store.head)
+        if head_state is None:
             return
 
-        logger.info(
-            "Block received from peer %s slot=%s (state=%s)",
-            peer_id,
-            block.block.slot,
-            self._state.name,
-        )
+        for validator_index in self.registry.indices():
+            attestation_data = store.produce_attestation_data(slot)
+            signed_attestation = self._sign_attestation(attestation_data, validator_index)
 
-        if self._head_sync is None:
-            raise RuntimeError("HeadSync not initialized")
+            self._attestations_produced += 1
 
-        # Delegate to HeadSync for processing logic.
-        #
-        # HeadSync determines if:
-        # - the block can be processed immediately (parent known) or
-        # - must be cached (parent unknown, triggers backfill).
-        result, new_store = await self._head_sync.on_gossip_block(
-            block=block,
-            peer_id=peer_id,
-            store=self.store,
-        )
-
-        # Only update our store if the block was actually processed.
-        #
-        # A block may be cached instead of processed if its parent is unknown.
-        if result.processed:
-            slot = block.block.slot
-            block_root = hash_tree_root(block.block)
-            logger.info(
-                "Block processed slot=%s root=%s from peer %s",
-                slot,
-                block_root.hex(),
-                peer_id,
-            )
-            self.store = new_store
-            self._replay_pending_attestations()
-
-        # Each processed block might complete our sync.
-        #
-        # We check after every block because gossip can deliver the final
-        # block needed to catch up with the network.
-        await self._check_sync_complete()
-
-    async def on_gossip_attestation(
-        self,
-        attestation: SignedAttestation,
-        peer_id: PeerId | None = None,
-    ) -> None:
-        """
-        Handle attestation received via gossip.
-
-        Attestations are votes from validators about which chain head they see.
-        They influence forkchoice by adding weight to branches of the block tree.
-        A branch with more attestation weight is more likely to become canonical.
-
-        Unlike blocks, attestations do not require parent lookups. They reference
-        a target checkpoint that must already exist in our store.
-
-        Args:
-            attestation: The signed attestation received.
-            peer_id: Peer that propagated the attestation (None if produced locally).
-        """
-        # Guard: Only process gossip in states that accept it.
-        #
-        # Without peer status information, we cannot assess the validity context
-        # of incoming attestations. IDLE state waits for peer discovery.
-        if not self._state.accepts_gossip:
-            return
-
-        slot = attestation.data.slot
-        validator_id = attestation.validator_id
-        peer_str = str(peer_id) if peer_id is not None else "local"
-        logger.info(
-            "Attestation received from peer %s slot=%s validator=%s",
-            peer_str,
-            slot,
-            validator_id,
-        )
-
-        # Check if we are an aggregator.
-        #
-        # A validator acts as an aggregator when it is active (has an ID)
-        # and the node operator has enabled aggregator mode.
-        is_aggregator_role = self.store.validator_id is not None and self.is_aggregator
-
-        # Integrate the attestation into forkchoice state.
-        #
-        # The store validates the signature and updates branch weights.
-        # Invalid attestations (bad signature, unknown target) are rejected.
-        # Validation failures are logged but don't crash the event loop.
-        t0 = time.perf_counter()
-        try:
-            self.store = self.store.on_gossip_attestation(
-                signed_attestation=attestation,
-                is_aggregator=is_aggregator_role,
-            )
-            metrics.lean_attestation_validation_time_seconds.observe(time.perf_counter() - t0)
-            metrics.lean_attestations_valid_total.labels(source="gossip").inc()
-            logger.info(
-                "Attestation from peer %s slot=%s validator=%s: validation and signature ok",
-                peer_str,
-                slot,
-                validator_id,
-            )
-        except (AssertionError, KeyError) as e:
-            metrics.lean_attestations_invalid_total.labels(source="gossip").inc()
-            logger.warning(
-                "Attestation from peer %s slot=%s validator=%s: validation or signature failed: %s",
-                peer_str,
-                slot,
-                validator_id,
-                e,
-            )
-            # Attestation references a block not yet in our store.
+            # Process attestation locally before publishing.
             #
-            # Buffer it for replay after the next block is processed.
-            # This handles the common case where attestations arrive
-            # slightly before the block they reference.
-            self._pending_attestations.append(attestation)
-            if len(self._pending_attestations) > MAX_PENDING_ATTESTATIONS:
-                self._pending_attestations = self._pending_attestations[-MAX_PENDING_ATTESTATIONS:]
-
-    async def on_gossip_aggregated_attestation(
-        self,
-        signed_attestation: SignedAggregatedAttestation,
-        peer_id: PeerId | None = None,
-    ) -> None:
-        """
-        Handle aggregated attestation received via gossip.
-
-        Aggregated attestations are collections of individual votes for the same
-        target, signed by an aggregator. They provide efficient propagation of
-        consensus weight.
-
-        Args:
-            signed_attestation: The signed aggregated attestation received.
-            peer_id: Peer that propagated the attestation (None if produced locally).
-        """
-        if not self._state.accepts_gossip:
-            return
-
-        slot = signed_attestation.data.slot
-        peer_str = str(peer_id) if peer_id is not None else "local"
-        logger.info(
-            "Aggregated attestation received from peer %s slot=%s",
-            peer_str,
-            slot,
-        )
-
-        try:
-            self.store = self.store.on_gossip_aggregated_attestation(signed_attestation)
-            logger.info(
-                "Aggregated attestation from peer %s slot=%s: validation and signature ok",
-                peer_str,
-                slot,
+            # Gossipsub does not deliver messages back to the sender.
+            # Without local processing, the aggregator node never sees its own
+            # validator's attestation in attestation_signatures, reducing the
+            # aggregation count below the 2/3 safe-target threshold.
+            is_aggregator_role = (
+                self.sync_service.store.validator_id is not None and self.sync_service.is_aggregator
             )
-        except (AssertionError, KeyError) as e:
-            logger.warning(
-                "Aggregated attestation from peer %s slot=%s: validation or signature failed: %s",
-                peer_str,
-                slot,
-                e,
-            )
-            # Target block not yet processed. Buffer for replay.
-            self._pending_aggregated_attestations.append(signed_attestation)
-            if len(self._pending_aggregated_attestations) > MAX_PENDING_ATTESTATIONS:
-                self._pending_aggregated_attestations = self._pending_aggregated_attestations[
-                    -MAX_PENDING_ATTESTATIONS:
-                ]
-
-    def _replay_pending_attestations(self) -> None:
-        """Retry buffered attestations after a block is processed.
-
-        Drains both pending queues, attempting each attestation against the
-        updated store. Attestations that still fail (e.g., referencing a block
-        not yet received) are kept in the buffer for the next replay attempt.
-        The buffer is bounded by MAX_PENDING_ATTESTATIONS to prevent unbounded growth.
-        """
-        is_aggregator_role = self.store.validator_id is not None and self.is_aggregator
-
-        pending = self._pending_attestations
-        self._pending_attestations = []
-        for attestation in pending:
             try:
-                self.store = self.store.on_gossip_attestation(
-                    signed_attestation=attestation,
+                self.sync_service.store = self.sync_service.store.on_gossip_attestation(
+                    signed_attestation=signed_attestation,
                     is_aggregator=is_aggregator_role,
                 )
-            except (AssertionError, KeyError):
-                self._pending_attestations.append(attestation)
+            except Exception:
+                # Best-effort: the attestation always goes via gossip regardless.
+                logger.debug(
+                    "on_gossip_attestation failed for validator %d at slot %d",
+                    validator_index,
+                    slot,
+                    exc_info=True,
+                )
 
-        pending_agg = self._pending_aggregated_attestations
-        self._pending_aggregated_attestations = []
-        for signed_attestation in pending_agg:
-            try:
-                self.store = self.store.on_gossip_aggregated_attestation(signed_attestation)
-            except (AssertionError, KeyError):
-                self._pending_aggregated_attestations.append(signed_attestation)
+            # Emit the attestation for network propagation.
+            await self.on_attestation(signed_attestation)
 
-    async def publish_aggregated_attestation(
+    def _sign_block(
         self,
-        signed_attestation: SignedAggregatedAttestation,
-    ) -> None:
+        block: Block,
+        validator_index: ValidatorIndex,
+        attestation_signatures: list[AggregatedSignatureProof],
+    ) -> SignedBlock:
         """
-        Publish an aggregated attestation to the network.
+        Sign a block and wrap it for publishing.
 
-        Called by the chain service when this node acts as an aggregator.
+        Signs hash_tree_root(block) with the proposer's proposal key.
 
         Args:
-            signed_attestation: The aggregate to publish.
-        """
-        await self._publish_agg_fn(signed_attestation)
-
-    async def start_sync(self) -> None:
-        """
-        Start or resume synchronization.
-
-        This is the main entry point for initiating sync. It assesses the
-        current state and begins appropriate sync activities.
-        """
-        # Serialize sync operations to prevent race conditions.
-        #
-        # Without this lock, concurrent calls to start_sync could cause
-        # duplicate state transitions or conflicting sync operations.
-        async with self._sync_lock:
-            await self._check_sync_trigger()
-
-    async def process_pending_blocks(self) -> int:
-        """
-        Process all blocks in cache that now have parents.
-
-        Called after backfill completes or when blocks may have become
-        processable.
+            block: The block to sign.
+            validator_index: Index of the proposing validator.
+            attestation_signatures: Aggregated signatures for included attestations.
 
         Returns:
-            Number of blocks processed.
+            Signed block ready for publishing.
         """
-        if self._head_sync is None:
-            raise RuntimeError("HeadSync not initialized")
+        entry = self.registry.get(validator_index)
+        if entry is None:
+            raise ValueError(f"No secret key for validator {validator_index}")
 
-        # Process blocks in topological order (parents before children).
-        #
-        # When backfill fetches missing parents, it may unlock a chain of
-        # waiting blocks. HeadSync handles the ordering to ensure each block
-        # is processed only after its parent is in the store.
-        count, new_store = await self._head_sync.process_all_processable(self.store)
-        self.store = new_store
+        # Sign the block root with the proposal key.
+        block_root = hash_tree_root(block)
+        _, proposer_signature = self._sign_with_key(
+            entry,
+            block.slot,
+            block_root,
+            "proposal_secret_key",
+        )
 
-        return count
+        signature = BlockSignatures(
+            attestation_signatures=AttestationSignatures(data=attestation_signatures),
+            proposer_signature=proposer_signature,
+        )
 
-    async def _check_sync_trigger(self) -> None:
+        return SignedBlock(
+            block=block,
+            signature=signature,
+        )
+
+    def _sign_attestation(
+        self,
+        attestation_data: AttestationData,
+        validator_index: ValidatorIndex,
+    ) -> SignedAttestation:
         """
-        Check if sync should be triggered based on current state.
+        Sign an attestation for publishing.
 
-        Transitions to SYNCING if we have peers and are behind the network.
-        """
-        # Guard: Only trigger sync from stable states.
-        #
-        # If already SYNCING, we should not re-trigger.
-        # This prevents redundant state transitions.
-        if self._state.is_syncing:
-            return
-
-        # Guard: Require peer information before syncing.
-        #
-        # Without peer status messages, we cannot determine if we are behind.
-        # A None value means no peers have reported their finalized slot yet.
-        network_finalized = self.peer_manager.get_network_finalized_slot()
-        if network_finalized is None:
-            return
-
-        head_slot = self.store.blocks[self.store.head].slot
-
-        # Trigger sync if the network has finalized blocks we do not have.
-        #
-        # Finalized blocks are guaranteed to never be reverted, so if the
-        # network has finalized past our head, we are definitely behind.
-        if network_finalized > head_slot:
-            await self._transition_to(SyncState.SYNCING)
-        elif self._state.is_idle:
-            # Transition from IDLE even if caught up.
-            #
-            # IDLE -> SYNCING enables gossip processing. Even if our head matches
-            # the network, we need to enter SYNCING to begin accepting blocks.
-            await self._transition_to(SyncState.SYNCING)
-
-    async def _check_sync_complete(self) -> None:
-        """
-        Check if sync is complete and transition to SYNCED if so.
-
-        We consider sync complete when our head is at or past the network
-        finalized slot and there are no orphan blocks.
-        """
-        # Guard: Only check completion while actively syncing.
-        if not self._state.is_syncing:
-            return
-
-        # Invariant: All orphan blocks must be resolved before declaring synced.
-        #
-        # Orphans indicate pending backfill requests. If we have orphans, we are
-        # still waiting for parent blocks to arrive from peers.
-        if self.block_cache.orphan_count > 0:
-            return
-
-        network_finalized = self.peer_manager.get_network_finalized_slot()
-        if network_finalized is None:
-            return
-
-        head_slot = self.store.blocks[self.store.head].slot
-
-        # Sync is complete when our head reaches the network finalized slot.
-        #
-        # We use >= because our head might be ahead of finalized (we may have
-        # received unfinalized blocks via gossip). The key threshold is reaching
-        # finalized, which means we have the canonical chain history.
-        if head_slot >= network_finalized:
-            await self._transition_to(SyncState.SYNCED)
-
-    async def _transition_to(self, new_state: SyncState) -> None:
-        """
-        Transition to a new sync state.
+        Signs the attestation data root with the validator's attestation key.
 
         Args:
-            new_state: Target state.
+            attestation_data: The attestation data to sign.
+            validator_index: Index of the attesting validator.
 
-        Raises:
-            ValueError: If transition is not allowed.
+        Returns:
+            Signed attestation ready for publishing.
         """
-        # Validate the transition against the state machine rules.
-        #
-        # The state machine enforces valid transitions:
-        # - IDLE -> SYNCING (start sync)
-        # - SYNCING -> SYNCED (caught up)
-        # - SYNCED -> SYNCING (fell behind)
-        # - Any -> IDLE (reset)
-        if not self._state.can_transition_to(new_state):
-            raise ValueError(f"Invalid state transition: {self._state.name} -> {new_state.name}")
+        # Get the secret key for this validator.
+        entry = self.registry.get(validator_index)
+        if entry is None:
+            raise ValueError(f"No secret key for validator {validator_index}")
 
-        self._state = new_state
+        # Sign the attestation data root with the attestation key.
+        _, signature = self._sign_with_key(
+            entry,
+            attestation_data.slot,
+            hash_tree_root(attestation_data),
+            "attestation_secret_key",
+        )
 
-    def reset(self) -> None:
+        return SignedAttestation(
+            validator_id=validator_index,
+            data=attestation_data,
+            signature=signature,
+        )
+
+    def _sign_with_key(
+        self,
+        entry: ValidatorEntry,
+        slot: Slot,
+        message: Bytes32,
+        key_field: Literal["attestation_secret_key", "proposal_secret_key"],
+    ) -> tuple[ValidatorEntry, Signature]:
         """
-        Reset all sync state.
+        Prepare an XMSS key for the given slot, sign, and update the registry.
 
-        Clears counters, caches, and returns to IDLE state.
+        Handles the full lifecycle:
+
+        1. Advance the key until the slot is within its prepared interval
+        2. Sign the message
+        3. Persist the updated key state in the registry
+
+        Args:
+            entry: Validator entry containing the secret keys.
+            slot: The slot to sign for.
+            message: The message bytes to sign.
+            key_field: Which secret key field to use and advance.
+
+        Returns:
+            Tuple of (updated entry, signature).
         """
-        # Return to initial state.
-        #
-        # IDLE is the starting state where we wait for peer connections.
-        self._state = SyncState.IDLE
-        self._blocks_processed = 0
+        scheme = TARGET_SIGNATURE_SCHEME
+        secret_key = getattr(entry, key_field)
 
-        # Clear the block cache to free memory.
-        #
-        # Cached blocks may be invalid or stale after a reset.
-        self.block_cache.clear()
+        slot_int = int(slot)
+        while slot_int not in scheme.get_prepared_interval(secret_key):
+            secret_key = scheme.advance_preparation(secret_key)
 
-        # Reset sub-components to clear their internal state.
-        #
-        # This ensures no stale backfill requests or pending operations remain.
-        if self._backfill is not None:
-            self._backfill.reset()
-        if self._head_sync is not None:
-            self._head_sync.reset()
+        signature = scheme.sign(secret_key, slot, message)
+
+        updated_entry = ValidatorEntry(
+            index=entry.index,
+            **{
+                "attestation_secret_key": entry.attestation_secret_key,
+                "proposal_secret_key": entry.proposal_secret_key,
+                key_field: secret_key,
+            },
+        )
+        self.registry.add(updated_entry)
+        return updated_entry, signature
+
+    def stop(self) -> None:
+        """
+        Stop the service.
+
+        Sets the running flag to False, causing the main loop to exit
+        after completing its current sleep cycle.
+        """
+        self._running = False
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the service is currently running."""
+        return self._running
+
+    @property
+    def blocks_produced(self) -> int:
+        """Total blocks produced since creation."""
+        return self._blocks_produced
+
+    @property
+    def attestations_produced(self) -> int:
+        """Total attestations produced since creation."""
+        return self._attestations_produced
