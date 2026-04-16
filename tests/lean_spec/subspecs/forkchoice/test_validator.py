@@ -149,11 +149,11 @@ class TestBlockProduction:
         assert block1_hash in sample_store.blocks
         assert block1_hash in sample_store.states
 
-        # Without any attestations, the forkchoice will stay on genesis
-        # This is the expected behavior: block1 exists but isn't the head
-        # So block2 should build on genesis, not block1
+        # After production, head advances to block1 via update_head().
+        # LMD GHOST follows the single child from genesis even without attestations.
+        assert sample_store.head == block1_hash
 
-        # Produce block for slot 2 (will build on genesis due to forkchoice)
+        # Produce block for slot 2 (builds on block1, the current head)
         sample_store, block2, _signatures2 = sample_store.produce_block_with_signatures(
             Slot(2),
             ValidatorIndex(2),
@@ -162,16 +162,13 @@ class TestBlockProduction:
         # Verify block properties
         assert block2.slot == Slot(2)
         assert block2.proposer_index == ValidatorIndex(2)
+        assert block2.parent_root == block1_hash
 
-        # The parent should be genesis (the current head), not block1
-        genesis_hash = sample_store.head
-        assert block2.parent_root == genesis_hash
-
-        # Both blocks should exist in the store
+        # Both blocks should exist in the store, chained sequentially
         block2_hash = hash_tree_root(block2)
+        assert sample_store.head == block2_hash
         assert block1_hash in sample_store.blocks
         assert block2_hash in sample_store.blocks
-        assert genesis_hash in sample_store.blocks
 
     def test_produce_block_empty_attestations(self, sample_store: Store) -> None:
         """Test block production with no available attestations."""
