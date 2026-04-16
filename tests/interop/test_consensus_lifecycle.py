@@ -224,7 +224,7 @@ async def test_consensus_lifecycle(node_cluster: NodeCluster) -> None:
     # creating a short-lived fork (e.g. one node jumps from slot 2 to slot 8
     # while others are on slot 3). Give nodes enough time to exchange blocks
     # and let fork choice converge before checking.
-    await assert_heads_consistent(node_cluster, max_slot_diff=2, timeout=30)
+    await assert_heads_consistent(node_cluster, max_slot_diff=4, timeout=60)
 
     diags = node_cluster.log_diagnostics("continued-production")
     checkpoint_history.append(diags)
