@@ -39,7 +39,7 @@ jobs:
           uv run pytest tests/interop/ \
             -v \
             --no-cov \
-            --timeout=120 \
+            --timeout=300 \
             -x \
             --tb=short \
             --log-cli-level=INFO

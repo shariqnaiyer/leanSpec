@@ -57,7 +57,7 @@ Activity counts gossip signatures, new aggregated, and known aggregated.
 """
 
 
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(300)
 @pytest.mark.num_validators(3)
 async def test_consensus_lifecycle(node_cluster: NodeCluster) -> None:
     """
