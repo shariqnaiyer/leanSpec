@@ -20,6 +20,9 @@ from lean_spec.types import ByteListMiB, Bytes32, Container
 
 from .containers import PublicKey, Signature
 
+_prover_initialized: set[LeanEnvMode] = set()
+_verifier_initialized: set[LeanEnvMode] = set()
+
 LOG_INV_RATE_TEST = 1
 """
 Inverse rate exponent for test mode (fastest, biggest proofs).
@@ -109,7 +112,9 @@ class AggregatedSignatureProof(Container):
         participants = ValidatorIndices(data=list(aggregated_validator_ids)).to_aggregation_bits()
 
         mode = mode or LEAN_ENV
-        setup_prover(mode=mode)
+        if mode not in _prover_initialized:
+            setup_prover(mode=mode)
+            _prover_initialized.add(mode)
 
         try:
             children_bytes = [
@@ -211,7 +216,9 @@ class AggregatedSignatureProof(Container):
             AggregationError: If verification fails.
         """
         mode = mode or LEAN_ENV
-        setup_verifier(mode=mode)
+        if mode not in _verifier_initialized:
+            setup_verifier(mode=mode)
+            _verifier_initialized.add(mode)
 
         try:
             verify_aggregated_signatures(
