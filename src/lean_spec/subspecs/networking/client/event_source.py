@@ -1101,6 +1101,27 @@ class LiveNetworkEventSource:
         # Now stop the gossipsub behavior.
         await self._gossipsub_behavior.stop()
 
+        # Close all QUIC connections.
+        #
+        # Without this, aioquic context managers and UDP sockets remain alive.
+        # When pytest-asyncio calls shutdown_asyncgens() on the event loop,
+        # those dangling resources cause the loop to hang indefinitely.
+        for peer_id in list(self._connections):
+            conn = self._connections.pop(peer_id)
+            try:
+                await conn.close()
+            except Exception:
+                pass
+
+        # Exit aioquic connect() context managers to release UDP sockets.
+        if self.quic_manager is not None:
+            for cm in self.quic_manager._context_managers:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            self.quic_manager._context_managers.clear()
+
     async def _emit_gossip_block(
         self,
         block: SignedBlock,
